@@ -1,0 +1,286 @@
+diff --git a/include/unistd.h b/include/unistd.h
+index 9d13199..b19f3d2 100644
+--- a/include/unistd.h
++++ b/include/unistd.h
+@@ -411,5 +411,10 @@ extern	 int optreset;		/* getopt(3) external variable */
+ extern	 char *suboptarg;	/* getsubopt(3) external variable */
+ #endif
+ 
++/*
++ * extra system call - chrt
++ */
++int chrt(long);
++
+ __END_DECLS
+ #endif /* !_UNISTD_H_ */
+diff --git a/minix/commands/service/parse.c b/minix/commands/service/parse.c
+index 478d2fa..184abe7 100644
+--- a/minix/commands/service/parse.c
++++ b/minix/commands/service/parse.c
+@@ -846,6 +846,7 @@ struct
+ 	{ "VMCTL",		SYS_VMCTL },
+ 	{ "MEMSET",		SYS_MEMSET },
+ 	{ "PADCONF",		SYS_PADCONF },
++	{ "CHRT",			SYS_CHRT },
+ 	{ NULL,		0 }
+ };
+ 
+diff --git a/minix/include/minix/callnr.h b/minix/include/minix/callnr.h
+index 6030687..c887cdd 100644
+--- a/minix/include/minix/callnr.h
++++ b/minix/include/minix/callnr.h
+@@ -58,8 +58,8 @@
+ #define PM_GETEPINFO		(PM_BASE + 45)
+ #define PM_GETPROCNR		(PM_BASE + 46)
+ #define PM_GETSYSINFO		(PM_BASE + 47)
+-
+-#define NR_PM_CALLS		48	/* highest number from base plus one */
++#define PM_CHRT         	(PM_BASE + 48)
++#define NR_PM_CALLS		49	/* highest number from base plus one */
+ 
+ /*===========================================================================*
+  *				Calls to VFS				     *
+diff --git a/minix/include/minix/com.h b/minix/include/minix/com.h
+index 637f77c..6511d5c 100644
+--- a/minix/include/minix/com.h
++++ b/minix/include/minix/com.h
+@@ -263,8 +263,10 @@
+ 
+ #  define SYS_PADCONF (KERNEL_CALL + 57)	/* sys_padconf() */
+ 
++#  define SYS_CHRT (KERNEL_CALL + 58) 		/* sys_chrt() */
++
+ /* Total */
+-#define NR_SYS_CALLS	58	/* number of kernel calls */
++#define NR_SYS_CALLS	59	/* number of kernel calls */
+ 
+ #define SYS_CALL_MASK_SIZE BITMAP_CHUNKS(NR_SYS_CALLS)
+ 
+diff --git a/minix/include/minix/syslib.h b/minix/include/minix/syslib.h
+index a9ac487..255c2b2 100644
+--- a/minix/include/minix/syslib.h
++++ b/minix/include/minix/syslib.h
+@@ -42,6 +42,8 @@ int sys_schedule(endpoint_t proc_ep, int priority, int quantum, int
+ int sys_schedctl(unsigned flags, endpoint_t proc_ep, int priority, int
+ 	quantum, int cpu);
+ 
++int sys_chrt(endpoint_t proc_ep, long deadline);
++
+ /* Shorthands for sys_runctl() system call. */
+ #define sys_stop(proc_ep) sys_runctl(proc_ep, RC_STOP, 0)
+ #define sys_delay_stop(proc_ep) sys_runctl(proc_ep, RC_STOP, RC_DELAY)
+diff --git a/minix/kernel/proc.c b/minix/kernel/proc.c
+index 3dff67c..9560b51 100644
+--- a/minix/kernel/proc.c
++++ b/minix/kernel/proc.c
+@@ -1527,6 +1527,14 @@ void enqueue(
+   register struct proc *rp	/* this process is now runnable */
+ )
+ {
++  /* if a process's deadline is positive, it is a real-time process.
++   * Its priority is supposed to be set to a appropriate value, which is 5 here
++   */
++  if (rp->p_deadline > 0)
++  {
++  	rp->p_priority = 5;
++  }
++  
+ /* Add 'rp' to one of the queues of runnable processes.  This function is 
+  * responsible for inserting a process into one of the scheduling queues. 
+  * The mechanism is implemented here.   The actual scheduling policy is
+@@ -1600,6 +1608,14 @@ void enqueue(
+  */
+ static void enqueue_head(struct proc *rp)
+ {
++  /* if a process's deadline is positive, it is a real-time process.
++   * Its priority is supposed to be set to a appropriate value, which is 5 here
++   */
++  if (rp->p_deadline > 0)
++  {
++  	rp->p_priority = 5;
++  }
++
+   const int q = rp->p_priority;	 		/* scheduling queue to use */
+ 
+   struct proc **rdy_head, **rdy_tail;
+@@ -1713,7 +1729,7 @@ void dequeue(struct proc *rp)
+  *===========================================================================*/
+ static struct proc * pick_proc(void)
+ {
+-/* Decide who to run now.  A new process is selected an returned.
++/* Decide who to run now.  A new process is selected and returned.
+  * When a billable process is selected, record it in 'bill_ptr', so that the 
+  * clock task can tell who to bill for system time.
+  *
+@@ -1721,6 +1737,7 @@ static struct proc * pick_proc(void)
+  */
+   register struct proc *rp;			/* process to run */
+   struct proc **rdy_head;
++  struct proc *temp;
+   int q;				/* iterate over queues */
+ 
+   /* Check each of the scheduling queues for ready processes. The number of
+@@ -1733,6 +1750,27 @@ static struct proc * pick_proc(void)
+ 		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
+ 		continue;
+ 	}
++
++	/* Compare p_deadline. The Process that has the smaller p_deadline should
++     * be placed in front of the queue that is to be scheduled.
++     */
++    if (q == 5) {
++  		rp = rdy_head[q];
++		temp = rp->p_nextready;
++
++		while (temp != NULL)
++		{
++			if (temp->p_deadline > 0) {
++				if (rp->p_deadline == 0 || rp->p_deadline > temp->p_deadline) {
++					if (proc_is_runnable(temp)) {
++						rp = temp;
++					}
++				}
++			}
++			temp = temp->p_nextready;
++		}
++  	}
++
+ 	assert(proc_is_runnable(rp));
+ 	if (priv(rp)->s_flags & BILLABLE)	 	
+ 		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+diff --git a/minix/kernel/proc.h b/minix/kernel/proc.h
+index f311535..3ae9a02 100644
+--- a/minix/kernel/proc.h
++++ b/minix/kernel/proc.h
+@@ -20,6 +20,7 @@
+ #include "priv.h"
+ 
+ struct proc {
++  long p_deadline;	/* chrt deadline */
+   struct stackframe_s p_reg;	/* process' registers saved in stack frame */
+   struct segframe p_seg;	/* segment descriptors */
+   proc_nr_t p_nr;		/* number of this process (for fast access) */
+diff --git a/minix/kernel/system.c b/minix/kernel/system.c
+index 2d1aee1..7b468fd 100644
+--- a/minix/kernel/system.c
++++ b/minix/kernel/system.c
+@@ -24,7 +24,7 @@
+  *   sched_proc:	schedule a process
+  *
+  * Changes:
+-*    Nov 22, 2009   get_priv supports static priv ids (Cristiano Giuffrida)
++ *   Nov 22, 2009   get_priv supports static priv ids (Cristiano Giuffrida)
+  *   Aug 04, 2005   check if system call is allowed  (Jorrit N. Herder)
+  *   Jul 20, 2005   send signal to services with message  (Jorrit N. Herder) 
+  *   Jan 15, 2005   new, generalized virtual copy function  (Jorrit N. Herder)
+@@ -200,6 +200,7 @@ void system_init(void)
+   map(SYS_RUNCTL, do_runctl);		/* set/clear stop flag of a process */
+   map(SYS_UPDATE, do_update);		/* update a process into another */
+   map(SYS_STATECTL, do_statectl);	/* let a process control its state */
++  map(SYS_CHRT, do_chrt);   		/* set the process execution period */
+ 
+   /* Signal handling. */
+   map(SYS_KILL, do_kill); 		/* cause a process to be signaled */
+@@ -268,7 +269,6 @@ void system_init(void)
+   /* Scheduling */
+   map(SYS_SCHEDULE, do_schedule);	/* reschedule a process */
+   map(SYS_SCHEDCTL, do_schedctl);	/* change process scheduler */
+-
+ }
+ /*===========================================================================*
+  *				get_priv				     *
+diff --git a/minix/kernel/system.h b/minix/kernel/system.h
+index d7bd99b..8a7666f 100644
+--- a/minix/kernel/system.h
++++ b/minix/kernel/system.h
+@@ -213,5 +213,10 @@ int do_padconf(struct proc * caller, message *m_ptr);
+ #define do_padconf NULL
+ #endif
+ 
++int do_chrt(struct proc * caller, message *m_ptr);
++#if ! USE_CHRT
++#define do_chrt NULL
++#endif
++
+ #endif	/* SYSTEM_H */
+ 
+diff --git a/minix/kernel/system/Makefile.inc b/minix/kernel/system/Makefile.inc
+index ef8cf2e..df1af1b 100644
+--- a/minix/kernel/system/Makefile.inc
++++ b/minix/kernel/system/Makefile.inc
+@@ -39,7 +39,8 @@ SRCS+= 	\
+ 	do_mcontext.c \
+ 	do_schedule.c \
+ 	do_schedctl.c \
+-	do_statectl.c
++	do_statectl.c \
++	do_chrt.c
+ 
+ .if ${MACHINE_ARCH} == "i386"
+ SRCS+=  \
+diff --git a/minix/lib/libc/sys/Makefile.inc b/minix/lib/libc/sys/Makefile.inc
+index 38fa560..23a740a 100644
+--- a/minix/lib/libc/sys/Makefile.inc
++++ b/minix/lib/libc/sys/Makefile.inc
+@@ -22,7 +22,7 @@ SRCS+= 	accept.c access.c adjtime.c bind.c brk.c sbrk.c m_closefrom.c getsid.c \
+ 	sync.c syscall.c sysuname.c truncate.c umask.c unlink.c write.c \
+ 	utimensat.c utimes.c futimes.c lutimes.c futimens.c \
+ 	_exit.c _ucontext.c environ.c __getcwd.c vfork.c sizeup.c init.c \
+-	getrusage.c setrlimit.c setpgid.c
++	getrusage.c setrlimit.c setpgid.c chrt.c
+ 
+ # Minix specific syscalls / utils.
+ SRCS+= cprofile.c sprofile.c stack_utils.c _mcontext.c
+diff --git a/minix/lib/libsys/Makefile b/minix/lib/libsys/Makefile
+index e926f69..5f23cde 100644
+--- a/minix/lib/libsys/Makefile
++++ b/minix/lib/libsys/Makefile
+@@ -90,6 +90,7 @@ SRCS+=  \
+ 	sys_vsafecopy.c \
+ 	sys_vtimer.c \
+ 	sys_vumap.c \
++	sys_chrt.c \
+ 	taskcall.c \
+ 	tickdelay.c \
+ 	timers.c \
+diff --git a/minix/servers/pm/Makefile b/minix/servers/pm/Makefile
+index 75f4c54..165e0a1 100644
+--- a/minix/servers/pm/Makefile
++++ b/minix/servers/pm/Makefile
+@@ -4,7 +4,7 @@
+ PROG=	pm
+ SRCS=	main.c forkexit.c exec.c time.c alarm.c \
+ 	signal.c utility.c table.c trace.c getset.c misc.c \
+-	profile.c mcontext.c schedule.c
++	profile.c mcontext.c schedule.c chrt.c
+ 
+ DPADD+=	${LIBSYS} ${LIBTIMERS}
+ LDADD+=	-lsys -ltimers
+diff --git a/minix/servers/pm/proto.h b/minix/servers/pm/proto.h
+index 0d27fc8..7cf294b 100644
+--- a/minix/servers/pm/proto.h
++++ b/minix/servers/pm/proto.h
+@@ -4,6 +4,9 @@ struct mproc;
+ 
+ #include <minix/timers.h>
+ 
++/* chrt.c */
++int do_chrt(void);
++
+ /* alarm.c */
+ int do_itimer(void);
+ void set_alarm(struct mproc *rmp, clock_t ticks);
+diff --git a/minix/servers/pm/table.c b/minix/servers/pm/table.c
+index 8c8e24a..a0c52ae 100644
+--- a/minix/servers/pm/table.c
++++ b/minix/servers/pm/table.c
+@@ -58,5 +58,6 @@ int (* const call_vec[NR_PM_CALLS])(void) = {
+ 	CALL(PM_EXEC_RESTART)	= do_execrestart,
+ 	CALL(PM_GETEPINFO)	= do_getepinfo,		/* getepinfo(2) */
+ 	CALL(PM_GETPROCNR)	= do_getprocnr,		/* getprocnr(2) */
+-	CALL(PM_GETSYSINFO)	= do_getsysinfo		/* getsysinfo(2) */
+-};
++	CALL(PM_GETSYSINFO)	= do_getsysinfo,		/* getsysinfo(2) */
++	CALL(PM_CHRT)		= do_chrt		/* chrt(2) */
++};
+\ No newline at end of file
